@@ -174,7 +174,13 @@ source ~/cocoon-env/bin/activate
 cd ~/cocoon            # the folder with app.py, requirements.txt and the best_ncnn_model folder
 pip install --upgrade pip
 pip install -r requirements.txt        # about a minute
+pip install lgpio                      # only if the venv was made WITHOUT --system-site-packages (see below)
 ```
+
+The GPIO library **`lgpio`** must be visible inside the virtual environment — either through `--system-site-packages` (the apt package) or with
+`pip install lgpio` (a ready-made wheel, no compiling). Without it gpiozero prints *"Falling back to the experimental pin factory NativeFactory"*,
+and `app.py` refuses to start on a real Pi rather than run with unreliable pins. If your venv lives inside the project folder (`.../coocon/venv`),
+it is already ignored by git.
 
 Put the **`best_ncnn_model`** folder (from `cocoon_model.zip`) next to `app.py` — that is the model the app loads by default.
 The Pi runs it with the small `ncnn` package: **no PyTorch, no Ultralytics** (their prebuilt wheels crash with *Illegal instruction* on a
@@ -279,6 +285,7 @@ Run a **dry cycle first**: no cocoons in the pusher path, watch the state line a
 | `Missing package (ncnn)` | `pip install ncnn pyyaml` (inside the virtual environment). |
 | `Model not found: 'best_ncnn_model'` | Copy the `best_ncnn_model` folder from `cocoon_model.zip` next to `app.py`, or `--model path`. |
 | `The model has classes [...] but app.py expects 'good' and 'bad'` | Rename the classes in Roboflow to `Good` / `Bad`, new version, retrain. |
+| `NativePinFactoryFallback` warning, `gpiozero found no proper GPIO library…`, or `PinPWMUnsupported: PWM is not supported on pin GPIO16` | gpiozero cannot see the `lgpio` library from inside your virtual environment. Fix: `source venv/bin/activate && pip install lgpio` (or recreate the venv with `--system-site-packages` after `sudo apt install python3-lgpio`), then start `app.py` again. Not a wiring problem. |
 | `GPIO library not found` (on the Pi) | `sudo apt install python3-lgpio`, and create the virtual environment with `--system-site-packages` (D2). The app deliberately refuses to "simulate" on a real Pi. |
 | `VIDIOC_REQBUFS: errno=19 (No such device)`, `No working camera found`, or `The camera stopped delivering pictures` | The camera node opens but the camera does not stream. `app.py` already retries with plain settings and tries the other `/dev/video` nodes (it prints which one it uses). If it still fails, work through this list: **(1) Power** — `vcgencmd get_throttled` must print `throttled=0x0`; anything else is under-voltage, so use a proper 5 V / 3 A supply or a powered USB hub for the webcam (the usual cause: the camera resets the moment it starts streaming). **(2) Other USB port** (blue = USB 3, black = USB 2), and a shorter cable. **(3) Right device:** `sudo apt install -y v4l-utils && v4l2-ctl --list-devices` shows the webcam's `/dev/videoN`; start with `python app.py --source N` (or set `CAMERA_INDEX`). **(4) Kernel log:** `dmesg \| tail -30` — `usb … disconnect` or `uvcvideo` errors mean a power or cable problem. **(5) Something else holds the camera:** `fuser -v /dev/video0`, close it. **(6)** It must be a **USB webcam**; a ribbon-cable Pi camera is not supported. |
 | Window does not open / `xcb` or `Authorization required` | Run from a terminal on the Pi's desktop, or `export DISPLAY=:0` first. Still failing: `sudo apt install -y libxcb-xinerama0`, or use the system OpenCV: `pip uninstall -y opencv-python` (with `python3-opencv` installed via apt). |

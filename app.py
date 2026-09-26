@@ -82,7 +82,7 @@ ROWS_PER_TRAY = 4             # 2 x 4 tray = 4 rows
 BUTTON_PIN = 17               # push button between this pin and GND
 RELAY_PIN = 4                 # conveyor relay (GPIO4 idles HIGH at power-up -> an active-low relay stays off)
 RELAY_ACTIVE_LOW = True       # True: pin LOW = conveyor ON.  Set False if your relay turns ON when idle.
-MOTOR_SPEED = 1.0             # 0.0 - 1.0
+MOTOR_SPEED = 1.0             # 1.0 = full speed on plain on/off pins; below 1.0 uses PWM (needs the lgpio library)
 # L298N.  Motor 1 pushes the RIGHT cocoon, motor 2 pushes the LEFT cocoon.
 # Keep the ENA/ENB jumpers on the L298N and leave enable=None.
 # (If you removed the jumpers and wired ENA/ENB to GPIO 12/13, set enable=12 / enable=13.)
@@ -209,11 +209,19 @@ class Hardware:
             self._setup()
 
     def _setup(self):
-        from gpiozero import Button, Motor, OutputDevice
+        from gpiozero import Button, Device, Motor, OutputDevice
+        Device.ensure_pin_factory()
+        if on_raspberry_pi() and type(Device.pin_factory).__name__ == "NativeFactory":
+            # gpiozero's fallback: no PWM and unreliable pull-ups (a floating button could start the conveyor)
+            sys.exit("gpiozero found no proper GPIO library and fell back to its experimental 'native' one.\n"
+                     "Install the real one, inside your virtual environment:\n"
+                     "  pip install lgpio\n"
+                     "(or:  sudo apt install python3-lgpio  and create the venv with --system-site-packages)")
         # active-low relay: .on() drives the pin LOW (relay ON), .off() drives it HIGH (relay OFF).
         # initial_value=False -> starts OFF.
         self.relay = OutputDevice(RELAY_PIN, active_high=not RELAY_ACTIVE_LOW, initial_value=False)
-        self.motors = {i: Motor(pwm=True, **pins) for i, pins in MOTORS.items()}
+        self.pwm = MOTOR_SPEED < 1                 # plain on/off pins unless a reduced speed is wanted
+        self.motors = {i: Motor(pwm=self.pwm, **pins) for i, pins in MOTORS.items()}
         self.button = Button(BUTTON_PIN, pull_up=True, bounce_time=0.05)
         self.button.when_pressed = self.start_event.set
         self.motor_dir = {i: "-" for i in MOTORS}
@@ -232,12 +240,12 @@ class Hardware:
     # -- pusher motors
     def motors_forward(self, ids):
         for i in ids:
-            self.motors[i].forward(MOTOR_SPEED)
+            self.motors[i].forward(MOTOR_SPEED if self.pwm else 1)
             self.motor_dir[i] = "FWD"
 
     def motors_backward(self, ids):
         for i in ids:
-            self.motors[i].backward(MOTOR_SPEED)
+            self.motors[i].backward(MOTOR_SPEED if self.pwm else 1)
             self.motor_dir[i] = "BACK"
 
     def motors_stop(self):

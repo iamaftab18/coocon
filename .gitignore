@@ -4,3 +4,8 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Virtual environments (e.g. ~/Coocons/coocon/venv on the Raspberry Pi)
+venv/
+.venv/
+env/
