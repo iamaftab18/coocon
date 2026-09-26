@@ -1,0 +1,15 @@
+# Cocoon sorter - Raspberry Pi 4B (Raspberry Pi OS 64-bit, Python 3.9 - 3.12)
+#
+#   python3 -m venv --system-site-packages ~/cocoon-env     (see README, Part 4)
+#   source ~/cocoon-env/bin/activate
+#   pip install -r requirements.txt
+#
+# Also works on a Windows / Linux PC for testing the detection with a webcam
+# (GPIO is simulated there). PyTorch, OpenCV and NumPy are pulled in by ultralytics.
+
+ultralytics>=8.3.0      # YOLOv8 (installs PyTorch, OpenCV, NumPy)
+gpiozero>=2.0           # push button, relay, L298N motors
+
+# Optional - much faster inference on the Pi with the NCNN model (best_ncnn_model/).
+# Ultralytics installs it automatically the first time it is needed; uncomment to install up front.
+# ncnn

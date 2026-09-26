@@ -1,0 +1,6 @@
+# Zip archives (Roboflow dataset export, Colab download) - not pushed
+*.zip
+
+# Python bytecode
+__pycache__/
+*.pyc
