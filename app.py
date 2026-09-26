@@ -199,7 +199,8 @@ class Hardware:
         except BadPinFactory:
             if on_raspberry_pi():         # never "simulate" on the real machine - the conveyor would not move
                 sys.exit("GPIO library not found. Install it with:  sudo apt install python3-lgpio\n"
-                         "and create the virtual environment with:  python3 -m venv --system-site-packages ~/cocoon-env")
+                         "and create the virtual environment with:\n"
+                         "  python3 -m venv --system-site-packages ~/cocoon-env")
             # Not a Raspberry Pi (e.g. testing on a PC): use fake pins so the app still runs.
             from gpiozero import Device
             from gpiozero.pins.mock import MockFactory, MockPWMPin
@@ -671,15 +672,85 @@ def draw(frame, res, sorter, hw, det_fps, cam_fps):
 # =============================================================================
 #  Main
 # =============================================================================
+CAMERA_MODES = (("MJPG", True), (None, True), (None, False))   # (pixel format, ask for FRAME_W x FRAME_H)
+MAX_BAD_READS = 30            # consecutive failed camera reads (about 1 s) before the app gives up
+
+
+def video_devices():
+    """Numbers N of the /dev/videoN nodes that exist (Linux)."""
+    nums = []
+    for path in glob.glob("/dev/video[0-9]*"):
+        tail = path[len("/dev/video"):]
+        if tail.isdigit():
+            nums.append(int(tail))
+    return sorted(nums)
+
+
+def _open_with(number, fourcc, size):
+    """Open camera `number` with one combination of settings, or return None."""
+    backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
+    params = []
+    if fourcc:
+        params += [cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc)]
+    if size:
+        params += [cv2.CAP_PROP_FRAME_WIDTH, FRAME_W, cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H]
+    try:
+        # settings given while opening: OpenCV does not have to stop and restart the stream for each one
+        cap = cv2.VideoCapture(number, backend, params) if params else cv2.VideoCapture(number, backend)
+    except (TypeError, cv2.error):                         # older OpenCV without the "parameters" form
+        cap = cv2.VideoCapture(number, backend)
+        if cap.isOpened():
+            for prop, value in zip(params[::2], params[1::2]):
+                cap.set(prop, value)
+    if cap.isOpened():
+        return cap
+    cap.release()
+    return None
+
+
+def _delivers_pictures(cap, tries=8):
+    for _ in range(tries):
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.size:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def open_camera(source):
-    backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") and isinstance(source, int) else cv2.CAP_ANY
-    cap = cv2.VideoCapture(source, backend)
-    if isinstance(source, int):
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))   # 30 fps on most USB webcams
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+    """Open the camera and PROVE that it delivers pictures - isOpened() alone is not enough for a USB camera.
+    Tries plain settings if the preferred ones fail, then the other /dev/video nodes. Returns None if none works."""
+    if not isinstance(source, int):                        # a video file (testing)
+        cap = cv2.VideoCapture(source)
+        return cap if cap.isOpened() else None
+    others = [n for n in video_devices() if n != source][:3] if sys.platform.startswith("linux") else []
+    for number in [source] + others:
+        for fourcc, size in CAMERA_MODES:
+            label = "camera %d (%s%s)" % (number, fourcc or "camera's own format",
+                                          ", %dx%d" % (FRAME_W, FRAME_H) if size else "")
+            cap = _open_with(number, fourcc, size)
+            if cap is not None and _delivers_pictures(cap):
+                print("Using %s" % label + ("" if number == source else "  <- set CAMERA_INDEX = %d" % number))
+                return cap
+            print("  %s: no picture" % label)
+            if cap is not None:
+                cap.release()
+    return None
+
+
+def camera_help(source):
+    if not isinstance(source, int):
+        return "Cannot open the video file %r" % (source,)
+    nodes = ", ".join("/dev/video%d" % n for n in video_devices()) or "none"
+    return ("No working camera found (tried camera %d and the other /dev/video nodes).\n"
+            "  /dev/video nodes present: %s\n"
+            "  1. Power: run  vcgencmd get_throttled  - anything but 0x0 means under-voltage; use a 5 V / 3 A supply\n"
+            "     or a powered USB hub for the camera, and try another USB port.\n"
+            "  2. Find the right number:  v4l2-ctl --list-devices  (sudo apt install v4l-utils),\n"
+            "     then  python app.py --source N\n"
+            "  3. Kernel messages:  dmesg | tail -30   (look for 'usb ... disconnect' or 'uvcvideo').\n"
+            "  4. Another program using the camera?   fuser -v /dev/video0\n"
+            "  5. It must be a USB webcam - a Raspberry Pi ribbon-cable camera is not supported." % (source, nodes))
 
 
 def main():
@@ -705,18 +776,24 @@ def main():
                      "Fix the class names in Roboflow, or change GOOD_NAME / BAD_NAME at the top of app.py."
                      % (sorted(detector.names.values()), GOOD_NAME, BAD_NAME))
         cap = open_camera(source)
-        if not cap.isOpened():
-            sys.exit("Cannot open camera / source: %r" % (source,))
+        if cap is None:
+            sys.exit(camera_help(source))
         detector.start()
         sorter = Sorter(hw)
-        cam_fps, last = 0.0, time.monotonic()
+        cam_fps, last, bad_reads = 0.0, time.monotonic(), 0
         print("Ready. Press the push button (or S in the window). Q quits.")
 
         while True:
             ok, frame = cap.read()
-            if not ok:
-                print("Camera read failed - stopping.")
-                break
+            if not ok:                                    # tolerate a short glitch, stop if it persists
+                bad_reads += 1
+                if bad_reads > MAX_BAD_READS:
+                    print("The camera stopped delivering pictures - check its USB cable and power "
+                          "(README, Troubleshooting).")
+                    break
+                time.sleep(0.03)
+                continue
+            bad_reads = 0
             now = time.monotonic()
             cam_fps = 0.9 * cam_fps + 0.1 / max(now - last, 1e-3)
             last = now
