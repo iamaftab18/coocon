@@ -15,16 +15,25 @@ Left / right = position in the camera image (see SWAP_LEFT_RIGHT). If anything i
 instead of guessing.
 
 Keys in the preview window:  S = start   X = emergency stop   Q = quit
-Run:  python app.py            (options: --model best.pt --source 0)
+Run:  python app.py            (options: --model best_ncnn_model --source 0)
+
+The model runs with NCNN (`pip install ncnn`), NOT with PyTorch: PyTorch's prebuilt wheels crash with
+"Illegal instruction" on a Raspberry Pi 4. A .pt model still works on a PC if Ultralytics is installed.
 """
 import argparse
+import faulthandler
+import glob
 import os
+import platform
 import sys
 import threading
 import time
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field
+
+faulthandler.enable()             # if the process ever dies natively ("Illegal instruction", segfault),
+                                  # Python prints where it was - much easier to diagnose
 
 if sys.platform.startswith("linux"):
     # pip's OpenCV can't open its window under Wayland unless Qt is told to use X11
@@ -38,8 +47,8 @@ import numpy as np
 # =============================================================================
 
 # ---- model ------------------------------------------------------------------
-MODEL_PATH = "best.pt"        # or the NCNN folder "best_ncnn_model" (faster on the Pi)
-IMG_SIZE = 416                # must equal the size used for training / export
+MODEL_PATH = "best_ncnn_model"   # NCNN folder from Colab (runs on the Pi). A .pt file works on a PC only.
+IMG_SIZE = 416                # only for a .pt model; an NCNN model uses the size it was exported with
 CONF_THRESHOLD = 0.50         # ignore detections less confident than this
 GOOD_NAME, BAD_NAME = "good", "bad"   # class names from Roboflow (case-insensitive)
 
@@ -257,16 +266,129 @@ class Hardware:
 
 
 # =============================================================================
-#  YOLO detector running in a background thread (keeps the preview smooth)
+#  Models. Both give:  .names {id: 'good'/'bad'}   and   .predict(frame) -> [Det, ...]
+# =============================================================================
+MAX_DET = 10
+NMS_IOU = 0.7                     # same defaults as Ultralytics
+
+
+def nms(boxes, scores, iou_thr):
+    """Plain greedy non-maximum suppression (class-agnostic). Returns the indices to keep."""
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size:
+        i, rest = order[0], order[1:]
+        keep.append(i)
+        if not rest.size:
+            break
+        w = np.clip(np.minimum(boxes[i, 2], boxes[rest, 2]) - np.maximum(boxes[i, 0], boxes[rest, 0]), 0, None)
+        h = np.clip(np.minimum(boxes[i, 3], boxes[rest, 3]) - np.maximum(boxes[i, 1], boxes[rest, 1]), 0, None)
+        inter = w * h
+        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+        area_r = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
+        order = rest[inter / (area_i + area_r - inter + 1e-9) <= iou_thr]
+    return keep
+
+
+class NcnnModel:
+    """A YOLOv8 model exported to NCNN, run with the plain `ncnn` package.
+    No PyTorch, no Ultralytics: that is what makes it work on a Raspberry Pi 4."""
+
+    def __init__(self, path):
+        try:
+            import ncnn
+            import yaml
+        except ImportError as exc:
+            sys.exit("Missing package (%s). Install with:  pip install ncnn pyyaml" % exc.name)
+        folder = path if os.path.isdir(path) else (os.path.dirname(path) or ".")
+        params = sorted(glob.glob(os.path.join(folder, "*.param")))
+        if not params:
+            sys.exit("No *.param file in %r - is that the NCNN model folder (best_ncnn_model)?" % folder)
+        with open(os.path.join(folder, "metadata.yaml")) as f:
+            meta = yaml.safe_load(f)
+        self.names = {int(k): str(v).lower() for k, v in meta["names"].items()}
+        size = meta["imgsz"]
+        self.h, self.w = (size, size) if isinstance(size, int) else (int(size[0]), int(size[1]))
+        self.ncnn = ncnn
+        self.net = ncnn.Net()
+        self.net.opt.use_vulkan_compute = False
+        self.net.opt.num_threads = os.cpu_count() or 4
+        self.net.load_param(params[0])
+        self.net.load_model(os.path.splitext(params[0])[0] + ".bin")
+        self.inp = self.net.input_names()[0]
+        self.out = sorted(self.net.output_names())[0]
+
+    def predict(self, frame):
+        h0, w0 = frame.shape[:2]
+        # letterbox exactly like Ultralytics: keep the aspect ratio, pad with grey 114, centred
+        r = min(self.h / h0, self.w / w0)
+        nw, nh = int(round(w0 * r)), int(round(h0 * r))
+        dw, dh = (self.w - nw) / 2, (self.h - nh) / 2
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR) if (nw, nh) != (w0, h0) else frame
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        blob = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1), dtype=np.float32) / 255.0   # RGB, CHW, 0..1
+
+        with self.net.create_extractor() as ex:
+            ex.input(self.inp, self.ncnn.Mat(blob).clone())
+            _, mat = ex.extract(self.out)
+            pred = np.array(mat).T                        # (candidates, 4 + classes): cx, cy, w, h, scores...
+
+        scores = pred[:, 4:]
+        cls = scores.argmax(1)
+        conf = scores[np.arange(len(scores)), cls]
+        keep = conf > CONF_THRESHOLD
+        if not keep.any():
+            return []
+        box, conf, cls = pred[keep, :4], conf[keep], cls[keep]
+        xyxy = np.stack([box[:, 0] - box[:, 2] / 2, box[:, 1] - box[:, 3] / 2,
+                         box[:, 0] + box[:, 2] / 2, box[:, 1] + box[:, 3] / 2], axis=1)
+        dets = []
+        for i in nms(xyxy, conf, NMS_IOU)[:MAX_DET]:
+            x1, y1, x2, y2 = xyxy[i]                      # back to the original picture
+            x1, x2 = np.clip([(x1 - left) / r, (x2 - left) / r], 0, w0)
+            y1, y2 = np.clip([(y1 - top) / r, (y2 - top) / r], 0, h0)
+            dets.append(Det(self.names[int(cls[i])], float(conf[i]), float(x1), float(y1), float(x2), float(y2)))
+        return dets
+
+
+class UltralyticsModel:
+    """A .pt (or .onnx) model through the Ultralytics package. Needs PyTorch: fine on a PC,
+    but PyTorch's prebuilt wheels crash on a Raspberry Pi 4 - use NcnnModel there."""
+
+    def __init__(self, path):
+        if platform.machine().lower() in ("aarch64", "arm64") and sys.platform.startswith("linux"):
+            print("NOTE: PyTorch can crash with 'Illegal instruction' on a Raspberry Pi 4. "
+                  "If it does, use the NCNN model:  python app.py --model best_ncnn_model")
+        from ultralytics import YOLO
+        self.model = YOLO(path, task="detect")
+        self.names = {int(k): str(v).lower() for k, v in self.model.names.items()}
+
+    def predict(self, frame):
+        out = self.model.predict(frame, imgsz=IMG_SIZE, conf=CONF_THRESHOLD, iou=NMS_IOU, agnostic_nms=True,
+                                 max_det=MAX_DET, verbose=False)[0]
+        return [Det(self.names[int(c)], float(p), *map(float, xyxy))
+                for xyxy, p, c in zip(out.boxes.xyxy.tolist(), out.boxes.conf.tolist(), out.boxes.cls.tolist())]
+
+
+def load_model(path):
+    """An NCNN folder (or .param file) -> NcnnModel, anything else -> UltralyticsModel."""
+    if os.path.isdir(path) or path.lower().endswith(".param"):
+        return NcnnModel(path)
+    return UltralyticsModel(path)
+
+
+# =============================================================================
+#  Detector: runs the model in a background thread (keeps the preview smooth)
 # =============================================================================
 class Detector(threading.Thread):
     def __init__(self, model_path):
         super().__init__(daemon=True)
-        from ultralytics import YOLO
-        self.model = YOLO(model_path, task="detect")
-        self.names = {int(k): str(v).lower() for k, v in self.model.names.items()}
+        self.model = load_model(model_path)
+        self.names = self.model.names
         # the first prediction is slow (lazy initialisation): do it now, so "Ready" really means ready
-        self.model.predict(np.zeros((FRAME_H, FRAME_W, 3), np.uint8), imgsz=IMG_SIZE, verbose=False)
+        self.model.predict(np.zeros((FRAME_H, FRAME_W, 3), np.uint8))
         self._lock = threading.Lock()
         self._frame = None
         self._t = 0.0
@@ -295,12 +417,7 @@ class Detector(threading.Thread):
                 last_id = fid
                 t0 = time.monotonic()
                 h, w = frame.shape[:2]
-                out = self.model.predict(frame, imgsz=IMG_SIZE, conf=CONF_THRESHOLD, agnostic_nms=True,
-                                         max_det=10, verbose=False)[0]
-                dets = [Det(self.names[int(c)], float(p), *map(float, xyxy))
-                        for xyxy, p, c in zip(out.boxes.xyxy.tolist(), out.boxes.conf.tolist(),
-                                              out.boxes.cls.tolist())]
-                self.result = Result(fid, t, w, h, dets)
+                self.result = Result(fid, t, w, h, self.model.predict(frame))
                 dt = time.monotonic() - t0
                 self.fps = 0.8 * self.fps + 0.2 / dt if self.fps else 1 / dt
         except Exception as exc:      # surface the error in the main loop so it can stop the conveyor
@@ -330,6 +447,7 @@ class Sorter:
         self.targets = []             # motors to fire for the current row
         self.votes = []               # (left, right) labels from frames with a complete row
         self.misses = 0               # scanned frames without a complete row
+        self.best_in_zone = 0         # most cocoons seen in the zone in one scanned frame (for error messages)
         self.seen = 0                 # frames looked at while re-checking a row after a push
         self.last_id = -1             # id of the last detector frame this state has looked at
 
@@ -427,12 +545,13 @@ class Sorter:
 
         elif s == "SETTLE":
             if el >= SETTLE_S:
-                self.votes, self.misses, self.scan_ids = [], 0, set()
+                self.votes, self.misses, self.scan_ids, self.best_in_zone = [], 0, set(), 0
                 self._enter("SCAN", "Scanning row %d" % (self.rows_done + 1))
 
         elif s == "SCAN":
             if self._fresh(res):
                 self.scan_ids |= {d.tid for d in zone_dets(res)}
+                self.best_in_zone = max(self.best_in_zone, len(zone_dets(res)))
                 row = find_row(res)
                 if row:
                     self.votes.append((row[0].label, row[1].label))
@@ -482,7 +601,8 @@ class Sorter:
             self.sought = True                            # creep forward ONCE (never twice - it could
             self._advance("Looking for the first row")    # overshoot, and a second try would skip row 1)
         else:
-            self._fail("row %d not found in the stop zone after stopping" % (self.rows_done + 1))
+            self._fail("row %d not found in the stop zone after stopping (best frame: %d of 2 cocoons)"
+                       % (self.rows_done + 1, self.best_in_zone))
 
     def _decide(self):
         self.seeking_first = False
@@ -564,14 +684,14 @@ def open_camera(source):
 
 def main():
     ap = argparse.ArgumentParser(description="Cocoon defect detection and sorting")
-    ap.add_argument("--model", default=MODEL_PATH, help="path to best.pt or an NCNN model folder")
+    ap.add_argument("--model", default=MODEL_PATH, help="NCNN model folder (best_ncnn_model), or a .pt file on a PC")
     ap.add_argument("--source", default=str(CAMERA_INDEX), help="camera index, or a video file for testing")
     args = ap.parse_args()
     source = int(args.source) if args.source.isdigit() else args.source
 
     if not os.path.exists(args.model):
-        sys.exit("Model not found: %r\nCopy the model you trained in Colab (best.pt) next to app.py, "
-                 "or pass --model <path>." % args.model)
+        sys.exit("Model not found: %r\nCopy the model you trained in Colab (the best_ncnn_model folder) next to "
+                 "app.py, or pass --model <path>." % args.model)
 
     hw = Hardware()                                   # relay and motors are OFF from here on
     detector = cap = None

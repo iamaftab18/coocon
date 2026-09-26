@@ -131,7 +131,8 @@ On the version page click **Export Dataset** (or *Download Dataset*), choose the
    - **Cell "Check the dataset":** confirms both classes are called `Good` / `Bad`, prints images and boxes per split.
    - **Cell "Train":** YOLOv8n, 416 px, batch 8, up to 60 epochs with early stopping — a few minutes on the T4 GPU.
    - **Cells "How good is it?" and "Predictions":** metrics, confusion matrix and pictures.
-   - **Cell "Export + download":** downloads **`cocoon_model.zip`** (contains `best.pt` and, if the conversion worked, `best_ncnn_model/`).
+   - **Cell "Export + download":** downloads **`cocoon_model.zip`** with **`best_ncnn_model/`** (the model the Raspberry Pi runs) and `best.pt`
+     (the PyTorch original, for a PC). If the NCNN conversion says *skipped*, run that cell again — it needs internet access in Colab.
 4. **Reading the result**
 
    | Number | Meaning | Good value |
@@ -155,7 +156,7 @@ On the version page click **Export Dataset** (or *Download Dataset*), choose the
 
 ## D1. What you need
 
-- Raspberry Pi 4B (4 GB recommended) with **Raspberry Pi OS 64-bit** (Bookworm, *with desktop*) — PyTorch/Ultralytics need the 64-bit OS
+- Raspberry Pi 4B (2 GB or more) with **Raspberry Pi OS 64-bit** *with desktop* (Bookworm or newer)
 - **USB webcam** (the kind you used for the dataset), monitor + keyboard (or VNC) for the preview window.
   A Raspberry Pi *Camera Module* (ribbon cable) needs a different library (`picamera2`) and is **not** supported by this `app.py`
 - 5 V **active-low** relay module for the conveyor · **L298N** motor driver · 2 pusher motors · push button · separate motor power supply
@@ -164,21 +165,20 @@ On the version page click **Export Dataset** (or *Download Dataset*), choose the
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y python3-venv python3-gpiozero python3-lgpio
+sudo apt install -y python3-venv python3-gpiozero python3-lgpio python3-yaml
 
 # virtual environment that can also see the GPIO libraries installed by apt
 python3 -m venv --system-site-packages ~/cocoon-env
 source ~/cocoon-env/bin/activate
 
-cd ~/cocoon            # the folder with app.py, requirements.txt, best.pt
+cd ~/cocoon            # the folder with app.py, requirements.txt and the best_ncnn_model folder
 pip install --upgrade pip
-pip install -r requirements.txt        # 10-20 minutes the first time (PyTorch is big)
+pip install -r requirements.txt        # about a minute
 ```
 
-Copy `best.pt` (from `cocoon_model.zip`) next to `app.py`. For **speed**, also copy the `best_ncnn_model` folder and start with
-`python app.py --model best_ncnn_model` (or change `MODEL_PATH`). NCNN is normally several times faster than PyTorch on the Pi's CPU.
-The on-screen `det … fps` shows what you really get. If the NCNN export failed in Colab, make it on the Pi:
-`yolo export model=best.pt format=ncnn imgsz=416`.
+Put the **`best_ncnn_model`** folder (from `cocoon_model.zip`) next to `app.py` — that is the model the app loads by default.
+The Pi runs it with the small `ncnn` package: **no PyTorch, no Ultralytics** (their prebuilt wheels crash with *Illegal instruction* on a
+Raspberry Pi 4, see Troubleshooting). `best.pt` is only for a PC. The on-screen `det … fps` shows the speed you really get.
 
 ## D3. First run — detection only
 
@@ -235,7 +235,7 @@ EOF
 | **2 · Left / right** | Put a Bad cocoon on the right: it must be labelled BAD on the right side of the picture and fire **motor 1**. Mirrored? `SWAP_LEFT_RIGHT = True`. |
 | **3 · `FIRST_MOVE_S`** | Start a tray and look after the first move: the first row must **not have passed** the stop zone yet (it may be short of it — the app then creeps forward to find it). Shorten it if row 1 is already beyond the zone. |
 | **4 · `NUDGE_S`** | Time the conveyor needs to bring a cocoon from the stop zone to the pushers (default 0.5 s). |
-| **5 · Belt speed** | Use `det … fps` on screen. In my simulations the sorting was reliable whenever the belt needed **about 2 s or more to move one row spacing**; with fast detection (10 fps) even ~1.2 s worked. Faster than that, the app stops with a *"row not found"* error instead of mis-sorting — slow the belt, use the NCNN model, or lower `IMG_SIZE`. |
+| **5 · Belt speed** | Use `det … fps` on screen. In my simulations the sorting was reliable whenever the belt needed **about 2 s or more to move one row spacing**; with fast detection (10 fps) even ~1.2 s worked. Faster than that, the app stops with a *"row not found"* error instead of mis-sorting — slow the belt, or train/export the model at a smaller `IMG_SIZE`. |
 | **6 · `CONF_THRESHOLD`** | 0.5 by default. Raise it if false detections appear, lower it if real cocoons are missed. |
 
 Run a **dry cycle first**: no cocoons in the pusher path, watch the state line and the `Conveyor / M1 / M2` line on screen, then a real tray.
@@ -275,13 +275,15 @@ Run a **dry cycle first**: no cocoons in the pusher path, watch the state line a
 
 | Symptom | Fix |
 |---|---|
-| `Model not found: 'best.pt'` | Copy the model from `cocoon_model.zip` next to `app.py`, or `--model path`. |
+| **`Illegal instruction`** (the program just dies) | PyTorch's prebuilt wheels use CPU instructions that the Pi 4's Cortex-A72 does not have ([PyTorch #132032](https://github.com/pytorch/pytorch/issues/132032), [#174344](https://github.com/pytorch/pytorch/issues/174344)). `app.py` now runs the NCNN model without PyTorch: put the `best_ncnn_model` folder next to it, `pip install ncnn pyyaml`, and run `python app.py`. Never start it with `--model best.pt` on a Pi 4. Still dying? `faulthandler` prints the Python line it died on — if it is `import cv2` / `import numpy`, use apt's versions: `pip uninstall -y opencv-python numpy` and `sudo apt install python3-opencv python3-numpy`. |
+| `Missing package (ncnn)` | `pip install ncnn pyyaml` (inside the virtual environment). |
+| `Model not found: 'best_ncnn_model'` | Copy the `best_ncnn_model` folder from `cocoon_model.zip` next to `app.py`, or `--model path`. |
 | `The model has classes [...] but app.py expects 'good' and 'bad'` | Rename the classes in Roboflow to `Good` / `Bad`, new version, retrain. |
 | `GPIO library not found` (on the Pi) | `sudo apt install python3-lgpio`, and create the virtual environment with `--system-site-packages` (D2). The app deliberately refuses to "simulate" on a real Pi. |
 | `Cannot open camera` | `ls /dev/video*`; try `--source 1`; unplug/replug; close other programs using the camera. |
 | Window does not open / `xcb` or `Authorization required` | Run from a terminal on the Pi's desktop, or `export DISPLAY=:0` first. Still failing: `sudo apt install -y libxcb-xinerama0`, or use the system OpenCV: `pip uninstall -y opencv-python` (with `python3-opencv` installed via apt). |
-| Very slow (`det` about 1 fps) | Use the NCNN model, close other programs, keep `IMG_SIZE` at 416 or 320 (train and export at the same size). |
-| `ERROR: row N not found in the stop zone after stopping` | The row stopped outside the yellow zone (belt too fast for the detection speed, or zone in the wrong place). Slow the belt / speed up detection / move `ROW_CENTER_Y`. |
+| Slow (`det` only 1-3 fps) | Close other programs; train and export at a smaller size (e.g. 320) in the notebook — the app follows the size stored in the model. |
+| `ERROR: row N not found in the stop zone after stopping (best frame: K of 2 cocoons)` | **K = 0:** the row stopped outside the yellow zone (belt too fast for the detection speed, or zone in the wrong place) — slow the belt / move `ROW_CENTER_Y`. **K = 1:** one cocoon is not detected with enough confidence (watch its `conf` in the preview; try a lower `CONF_THRESHOLD`, better light, or more training photos of that kind of cocoon). |
 | `ERROR: no cocoon reached the stop zone in 12 s` | No tray in the camera's view, or the stop zone is in the wrong place (D5, step 1). |
 | `ERROR: row N never arrived …` | Tray has fewer rows than `ROWS_PER_TRAY`, a slot is empty (every slot needs a cocoon), or `FIRST_MOVE_S` was so long that row 1 was skipped. |
 | `ERROR: detector gave no results` / `detector stopped delivering frames` | The model crashed or is far too slow — check the terminal output. |
@@ -300,8 +302,10 @@ Run a **dry cycle first**: no cocoons in the pusher path, watch the state line a
 ## Testing status (honest summary)
 
 Tested on a PC: the sorting state machine in a simulator (fake belt, tilted trays, mock GPIO, simulated detection noise, pusher scenarios, error paths);
-the whole app running in real time with a real YOLOv8 model, real threads and a moving belt built from your photos (4 rows sorted, motors fired as decided);
-and the notebook's code cells. Those runs used a throw-away model trained on auto-generated labels, so they prove the *plumbing*, not the Good/Bad accuracy —
-that depends on your labels (Part A) and shows up in Part C.
-**Not tested by me:** the real Raspberry Pi, GPIO / relay / L298N / belt, the Pi's frame rate, and the Roboflow and Colab web pages (steps written from
-experience — their menus move around a little over time; look for the equivalent button).
+the whole app running in real time with real threads and a moving belt built from your photos (4 rows sorted, motors fired as decided); and the
+notebook's code cells. The NCNN backend was checked against Ultralytics on **your trained model over all 91 photos**: identical detections to
+Ultralytics' own NCNN loader (0.00 px, 0.0000 confidence difference), and it loads no PyTorch or Ultralytics at all. The belt runs used a throw-away
+model or your model on a synthetic belt, so they prove the *plumbing*, not the Good/Bad accuracy — that depends on your labels (Part A).
+**Not tested by me:** the real Raspberry Pi (the `ncnn` package and the rest of this stack were only analysed, not run on a Cortex-A72),
+GPIO / relay / L298N / belt, the Pi's frame rate, and the Roboflow and Colab web pages (steps written from experience — their menus move around
+a little over time; look for the equivalent button).
